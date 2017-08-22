@@ -31,6 +31,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
+
 import okhttp3.Protocol;
 import okhttp3.internal.NamedRunnable;
 import okhttp3.internal.Util;
@@ -40,7 +41,6 @@ import okio.BufferedSource;
 import okio.ByteString;
 import okio.Okio;
 
-import static okhttp3.internal.Internal.logger;
 import static okhttp3.internal.framed.Settings.DEFAULT_INITIAL_WINDOW_SIZE;
 
 /**
@@ -668,7 +668,7 @@ public final class FramedConnection implements Closeable {
               try {
                 listener.onStream(newStream);
               } catch (IOException e) {
-                logger.log(Level.INFO, "FramedConnection.Listener failure for " + hostname, e);
+                //logger.log(Level.INFO, "FramedConnection.Listener failure for " + hostname, e);
                 try {
                   newStream.close(ErrorCode.PROTOCOL_ERROR);
                 } catch (IOException ignored) {

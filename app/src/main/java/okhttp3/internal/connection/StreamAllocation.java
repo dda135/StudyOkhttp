@@ -102,13 +102,13 @@ public final class StreamAllocation {
     int writeTimeout = client.writeTimeoutMillis();
     //获取之前在client中设置的是否允许重新连接
     boolean connectionRetryEnabled = client.retryOnConnectionFailure();
-
     try {
-      //尝试从连接池中获取可以复用的连接，相对来说Http2.0在这方面支持力度更大
-      //如果获取到可以复用的连接，但是要检查当前连接对应的socket的可用性
+      //尝试从连接池中获取可以复用的连接，对于Http1.1来说，一个已经完成的保持长连接的连接被同一个请求连接复用的可能性会大一点
+      //假设从连接池中获取到可以复用的连接，但是要检查当前连接对应的socket的可用性
       RealConnection resultConnection = findHealthyConnection(connectTimeout, readTimeout,
           writeTimeout, connectionRetryEnabled, doExtensiveHealthChecks);
       //根据HTTP2/HTTP1获取对应的请求和响应处理类（因为协议的不同，所以有所区别）
+      //一个请求会有一个执行类，执行完成之后会废弃（置空）
       HttpCodec resultCodec = resultConnection.newCodec(client, this);
 
       synchronized (connectionPool) {//标记当前流的请求和响应实现类
@@ -128,14 +128,16 @@ public final class StreamAllocation {
   private RealConnection findHealthyConnection(int connectTimeout, int readTimeout,
       int writeTimeout, boolean connectionRetryEnabled, boolean doExtensiveHealthChecks)
       throws IOException {
-    //此处通过循环直到成功获取连接为止
-    while (true) {
+    while (true) {//此处通过循环直到成功获取连接为止
+      //查找连接
       RealConnection candidate = findConnection(connectTimeout, readTimeout, writeTimeout,
           connectionRetryEnabled);
 
       // If this is a brand new connection, we can skip the extensive health checks.
       synchronized (connectionPool) {
-        //如果当前连接是新建的，可以直接省略健康的检查
+        //如果当前连接是新建的，直接使用当前连接即可
+        //在连接池中是的连接都是建立完成确实可用的，不会出现successCount为0的情况
+        //除非是新建的连接
         if (candidate.successCount == 0) {
           return candidate;
         }
@@ -143,9 +145,11 @@ public final class StreamAllocation {
 
       // Do a (potentially slow) check to confirm that the pooled connection is still good. If it
       // isn't, take it out of the pool and start again.
-      // 因为当前Connection之前已经完成过流的传输，这里要尝试检查连接是否还可用
+      // 校验当前连接的可用性，主要是因为有的连接是从连接池中复用的，那么需要保证这个复用的连接还可用
+      // 比方说当前socket连接是否正常、是否还可以传输数据
       if (!candidate.isHealthy(doExtensiveHealthChecks)) {
-        //当前Connection已经不再健康，关闭Socket和释放连接资源
+        //当前Connection已经不再健康，从连接池中移除，
+        //并且要关闭Socket连接
         noNewStreams();
         //继续查找其它可用的连接
         continue;
@@ -164,32 +168,34 @@ public final class StreamAllocation {
   private RealConnection findConnection(int connectTimeout, int readTimeout, int writeTimeout,
       boolean connectionRetryEnabled) throws IOException {
     Route selectedRoute;
-    synchronized (connectionPool) {//此处获取了连接池的锁，因为尝试从连接池中获取可以复用的连接，应该可以理解为消费者模型
+    synchronized (connectionPool) {//此处要获取连接池的锁，因为尝试从连接池中获取可以复用的连接，应该可以理解为消费/生产者模型
       if (released) throw new IllegalStateException("released");
       if (canceled) throw new IOException("Canceled");
       if (codec != null) throw new IllegalStateException("codec != null");
 
       // Attempt to use an already-allocated connection.
-      //首先注意这里connection初始一般为空
-      //这里主要就是分配连接的策略
+      // 首先尝试使用已经分配的连接
       RealConnection allocatedConnection = this.connection;
       if (allocatedConnection != null && !allocatedConnection.noNewStreams) {
         return allocatedConnection;
       }
 
       // Attempt to get a connection from the pool.
-      //尝试从连接池中获取一个连接
-      //这里其实就是调用connectionPoll.get方法
+      //尝试从连接池中获取一个连接，进而复用连接
+      //这里其实就是调用connectionPool.get方法
       Internal.instance.get(connectionPool, address, this, null);
       if (connection != null) {//从连接池中复用成功
         return connection;
       }
-      //这里注意一下route一开始都是空
+      //一个新的连接路由初始化都为空
+      //当一个连接成功之后，哪怕后续出现异常，这个路由都是正确的
+      //那么重试的时候会直接使用这个路由
       selectedRoute = route;
     }
 
     // If we need a route, make one. This is a blocking operation.
     // 内部实际上有通过InetAddress通过Host来查找IP，这是为了Socket连接提供IP和端口
+    // 内部会通过DNS做域名映射，从而获得域名所对应的IP地址
     if (selectedRoute == null) {
       selectedRoute = routeSelector.next();
     }
@@ -200,7 +206,8 @@ public final class StreamAllocation {
 
       // Now that we have an IP address, make another attempt at getting a connection from the pool.
       // This could match due to connection coalescing.
-      // 在Host不匹配的情况下，可以再次通过IP地址来进行查找可复用的连接
+      // 前面已经通过域名去尝试复用连接，走到这里说明没有命中
+      // 此处在Host不匹配的情况下，可以再次通过IP地址来进行查找可复用的连接
       Internal.instance.get(connectionPool, address, this, selectedRoute);
       if (connection != null) return connection;
 
@@ -208,20 +215,23 @@ public final class StreamAllocation {
       // for an asynchronous cancel() to interrupt the handshake we're about to do.
       route = selectedRoute;
       refusedStreamCount = 0;
-      //当前连接池中没有可重用的流，于是只能新建流
+      //无法重用流
+      //新建一个流对象
       result = new RealConnection(connectionPool, selectedRoute);
       //关联当前分配者分配的Connection
+      //主要是标记当前流正在使用中
       acquire(result);
     }
-    // 因为没有可以复用的连接，这里进行TCP和TLS的握手
+    // 这里进行TCP和TLS的握手
     // Do TCP + TLS handshakes. This is a blocking operation.
     result.connect(connectTimeout, readTimeout, writeTimeout, connectionRetryEnabled);
+    // 当前节点连接成功
     routeDatabase().connected(result.route());
 
     Socket socket = null;
     synchronized (connectionPool) {
       // Pool the connection.
-      // 将当前新建的连接放入连接池中
+      // 将当前已经建立的连接放入连接池中
       Internal.instance.put(connectionPool, result);
 
       // If another multiplexed connection to the same address was created concurrently, then
@@ -234,12 +244,17 @@ public final class StreamAllocation {
         result = connection;
       }
     }
-    //如果上面有被转移的流，可以关闭旧的socket连接
+
     closeQuietly(socket);
 
     return result;
   }
 
+  /**
+   * 一次连接成功从服务器完成读取响应正文体之后会调用
+   * @param noNewStreams
+   * @param codec
+   */
   public void streamFinished(boolean noNewStreams, HttpCodec codec) {
     Socket socket;
     synchronized (connectionPool) {
@@ -294,24 +309,29 @@ public final class StreamAllocation {
    */
   private Socket deallocate(boolean noNewStreams, boolean released, boolean streamFinished) {
     assert (Thread.holdsLock(connectionPool));
-
+    //当前连接完全结束，也就是TCP握手、TLS握手（有的话）、写入请求报文和读取请求报文这些操作全部完成之后
     if (streamFinished) {
       this.codec = null;
     }
+    //当前流分配者是否可用，如果released则表示后续流分配者不可继续使用
+    //一般来说连接完成之后，后续都是不可用的
+    //如果连接重连，那么同一个请求地址的应该还是可用的
     if (released) {
       this.released = true;
     }
     Socket socket = null;
+    //当前流分配者已经分配了一个连接
     if (connection != null) {
-      if (noNewStreams) {
+      if (noNewStreams) {//当前不允许重用连接
         connection.noNewStreams = true;
       }
+      //在一次正常的请求完成之后，要进行连接的释放
       if (this.codec == null && (this.released || connection.noNewStreams)) {
-        release(connection);
-        if (connection.allocations.isEmpty()) {
+        release(connection);//这里就是解除引用队列，从而标记当前connection后续可以复用
+        if (connection.allocations.isEmpty()) {//这里是尝试唤醒连接池中的清理任务
           connection.idleAtNanos = System.nanoTime();
           if (Internal.instance.connectionBecameIdle(connectionPool, connection)) {
-            socket = connection.socket();
+            socket = connection.socket();//如果当前连接已经过期，那么可以关闭socket连接了
           }
         }
         connection = null;
@@ -340,7 +360,7 @@ public final class StreamAllocation {
     boolean noNewStreams = false;
 
     synchronized (connectionPool) {
-      if (e instanceof StreamResetException) {
+      if (e instanceof StreamResetException) {//这个是Http2协议的，先忽略
         StreamResetException streamResetException = (StreamResetException) e;
         if (streamResetException.errorCode == ErrorCode.REFUSED_STREAM) {
           refusedStreamCount++;
@@ -352,10 +372,12 @@ public final class StreamAllocation {
           route = null;
         }
       } else if (connection != null
-          && (!connection.isMultiplexed() || e instanceof ConnectionShutdownException)) {
-        noNewStreams = true;
+          && (!connection.isMultiplexed() || e instanceof ConnectionShutdownException)) {//当前连接不为空，且不是http2协议
+        noNewStreams = true;//标记之后不会新建连接
 
         // If this route hasn't completed a call, avoid it for new connections.
+        // 当前连接没有成功，标记当前连接节点失败
+        // 当前连接被标记成功的条件是要求完成一次请求，并且从服务端成功读取响应体中的正文部分
         if (connection.successCount == 0) {
           if (route != null && e != null) {
             routeSelector.connectFailed(route, e);
@@ -363,6 +385,7 @@ public final class StreamAllocation {
           route = null;
         }
       }
+      //不新建流、当前流完成、不释放流分配者
       socket = deallocate(noNewStreams, false, true);
     }
 
@@ -378,6 +401,7 @@ public final class StreamAllocation {
     if (this.connection != null) throw new IllegalStateException();
 
     this.connection = connection;
+    //向引用队列中添加一个引用，表示当前连接正在被当前流分配者使用
     connection.allocations.add(new StreamAllocationReference(this, callStackTrace));
   }
 

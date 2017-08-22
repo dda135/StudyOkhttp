@@ -54,48 +54,48 @@ public final class CacheStrategy {
     this.cacheResponse = cacheResponse;
   }
 
-  /** Returns true if {@code response} can be stored to later serve another request. */
-  public static boolean isCacheable(Response response, Request request) {
-    // Always go to network for uncacheable response codes (RFC 7231 section 6.1),
-    // This implementation doesn't support caching partial content.
-    switch (response.code()) {
-      case HTTP_OK:
-      case HTTP_NOT_AUTHORITATIVE:
-      case HTTP_NO_CONTENT:
-      case HTTP_MULT_CHOICE:
-      case HTTP_MOVED_PERM:
-      case HTTP_NOT_FOUND:
-      case HTTP_BAD_METHOD:
-      case HTTP_GONE:
-      case HTTP_REQ_TOO_LONG:
-      case HTTP_NOT_IMPLEMENTED:
-      case StatusLine.HTTP_PERM_REDIRECT:
-        // These codes can be cached unless headers forbid it.
-        break;
-
-      case HTTP_MOVED_TEMP:
-      case StatusLine.HTTP_TEMP_REDIRECT:
-        // These codes can only be cached with the right response headers.
-        // http://tools.ietf.org/html/rfc7234#section-3
-        // s-maxage is not checked because OkHttp is a private cache that should ignore s-maxage.
-        if (response.header("Expires") != null
-            || response.cacheControl().maxAgeSeconds() != -1
-            || response.cacheControl().isPublic()
-            || response.cacheControl().isPrivate()) {
-          break;
-        }
-        // Fall-through.
-
-      default:
-        // All other codes cannot be cached.
-        return false;
-    }
-
-    // A 'no-store' directive on request or response prevents the response from being cached.
-    return !response.cacheControl().noStore() && !request.cacheControl().noStore();
-  }
-
   public static class Factory {
+
+    /** Returns true if {@code response} can be stored to later serve another request. */
+    public static boolean isCacheable(Response response, Request request) {
+      // Always go to network for uncacheable response codes (RFC 7231 section 6.1),
+      // This implementation doesn't support caching partial content.
+      switch (response.code()) {
+        case HTTP_OK:
+        case HTTP_NOT_AUTHORITATIVE:
+        case HTTP_NO_CONTENT:
+        case HTTP_MULT_CHOICE:
+        case HTTP_MOVED_PERM:
+        case HTTP_NOT_FOUND:
+        case HTTP_BAD_METHOD:
+        case HTTP_GONE:
+        case HTTP_REQ_TOO_LONG:
+        case HTTP_NOT_IMPLEMENTED:
+        case StatusLine.HTTP_PERM_REDIRECT:
+          // These codes can be cached unless headers forbid it.
+          break;
+
+        case HTTP_MOVED_TEMP:
+        case StatusLine.HTTP_TEMP_REDIRECT:
+          // These codes can only be cached with the right response headers.
+          // http://tools.ietf.org/html/rfc7234#section-3
+          // s-maxage is not checked because OkHttp is a private cache that should ignore s-maxage.
+          if (response.header("Expires") != null
+                  || response.cacheControl().maxAgeSeconds() != -1
+                  || response.cacheControl().isPublic()
+                  || response.cacheControl().isPrivate()) {
+            break;
+          }
+          // Fall-through.
+
+        default:
+          // All other codes cannot be cached.
+          return false;
+      }
+
+      // A 'no-store' directive on request or response prevents the response from being cached.
+      return !response.cacheControl().noStore() && !request.cacheControl().noStore();
+    }
     final long nowMillis;
     final Request request;
     final Response cacheResponse;

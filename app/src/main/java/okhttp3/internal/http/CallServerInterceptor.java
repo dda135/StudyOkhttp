@@ -42,11 +42,13 @@ public final class CallServerInterceptor implements Interceptor {
 
     long sentRequestMillis = System.currentTimeMillis();
     //到这里之前socket连接已经建立，流通道也已经准备完成
-    //将头部报文写入输出流中
+    // 开始将请求报文的一部分写入流中
+    // 起始行
+    // 头部报文
     httpCodec.writeRequestHeaders(request);
 
     Response.Builder responseBuilder = null;
-    //验证头部请求method合法且具有请求体内容
+    //验证头部请求method合法且具有请求体内容，比方此时是POST，那么需要一个正文体
     if (HttpMethod.permitsRequestBody(request.method()) && request.body() != null) {
       // If there's a "Expect: 100-continue" header on the request, wait for a "HTTP/1.1 100
       // Continue" response before transmitting the request body. If we don't get that, return what
@@ -103,15 +105,16 @@ public final class CallServerInterceptor implements Interceptor {
 
     if ("close".equalsIgnoreCase(response.request().header("Connection"))
         || "close".equalsIgnoreCase(response.header("Connection"))) {
+      //如果当前请求或者响应报文中指定当前为短连接，那么当前连接不应该进入连接池去复用
       streamAllocation.noNewStreams();
     }
-
+    //204和205是无内容状态码，所以此时不应该有正文体
     if ((code == 204 || code == 205) && response.body().contentLength() > 0) {
       throw new ProtocolException(
           "HTTP " + code + " had non-zero Content-Length: " + response.body().contentLength());
     }
 
     return response;
-    //到这里一次请求以及响应的数据设置就全部完成，剩下需要关注整个回调的流程
+    //到这里一次请求以及响应的数据设置就全部完成，剩下的会按照调用链向上返回
   }
 }

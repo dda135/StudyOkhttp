@@ -42,6 +42,7 @@ public final class StatusLine {
   }
 
   public static StatusLine parse(String statusLine) throws IOException {
+    //这个没什么说的，参见下面的例子就好
     // H T T P / 1 . 1   2 0 0   T e m p o r a r y   R e d i r e c t
     // 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0
 

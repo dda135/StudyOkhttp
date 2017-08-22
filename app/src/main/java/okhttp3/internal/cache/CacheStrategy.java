@@ -148,10 +148,10 @@ public final class CacheStrategy {
       this.nowMillis = nowMillis;
       //当前请求策略的请求
       this.request = request;
-      //当前尝试通过request获取的response
+      //当前从硬盘缓存中获得的当前请求的缓存响应数据
       this.cacheResponse = cacheResponse;
       //如果从缓存中获取成功
-      if (cacheResponse != null) {
+      if (cacheResponse != null) {//初始化头部中有关缓存的一些数据
         //该响应为本地当中的缓存
         //注意这个时间其实是在CallServerInterceptor中调用intercept时候初始化的时间，简称发送request的时间
         this.sentRequestMillis = cacheResponse.sentRequestAtMillis();
@@ -164,7 +164,7 @@ public final class CacheStrategy {
           if ("Date".equalsIgnoreCase(fieldName)) {//消息发送的时间（创建报文的时间）
             servedDate = HttpDate.parse(value);
             servedDateString = value;
-          } else if ("Expires".equalsIgnoreCase(fieldName)) {//消息应该过期的时间
+          } else if ("Expires".equalsIgnoreCase(fieldName)) {//消息应该过期的准确时间
             expires = HttpDate.parse(value);
           } else if ("Last-Modified".equalsIgnoreCase(fieldName)) {//客户端请求的资源在服务端的最后一次修改时间
             lastModified = HttpDate.parse(value);
@@ -224,8 +224,10 @@ public final class CacheStrategy {
       //下面通过获取request中的cache-control来实现最终的缓存策略
       //获取请求报头中cache-control对象
       CacheControl requestCaching = request.cacheControl();
-      //在request中的cache-control指定不使用缓存no-cache或者在头部报文中指定了If-Modified-Since/If-None-Match的时候
-      //认为缓存无效
+      //在request中的cache-control指定不使用缓存no-cache的时候，缓存无效
+      //在头部报文中指定了If-Modified-Since/If-None-Match的时候,
+      //此时应该将之前响应的Last-Modified的时间通过If-Modified-Since传递给服务器判断当前缓存是否有效
+      //那么在此之前，缓存无效
       if (requestCaching.noCache() || hasConditions(request)) {
         return new CacheStrategy(request, null);
       }
@@ -334,6 +336,7 @@ public final class CacheStrategy {
      * 2616, 13.2.3 Age Calculations.
      */
     private long cacheResponseAge() {
+      //一般来说Date就是服务端创建响应体的时间
       long apparentReceivedAge = servedDate != null
           ? Math.max(0, receivedResponseMillis - servedDate.getTime())
           : 0;
@@ -341,9 +344,9 @@ public final class CacheStrategy {
       long receivedAge = ageSeconds != -1
           ? Math.max(apparentReceivedAge, SECONDS.toMillis(ageSeconds))
           : apparentReceivedAge;
-      //计算整个请求从发出到响应的时间
+      //计算整个请求从发出到响应的时间，这个指的是客户端发出和接收到的时间间隔
       long responseDuration = receivedResponseMillis - sentRequestMillis;
-      //接收到response之后到当前所经过的时间
+      //接收到response之后到当前所经过的时间，或者说缓存在本地所经过的时间
       long residentDuration = nowMillis - receivedResponseMillis;
       //这里一般来说理解成该条response从当前到它在服务端生成所经过的时间即可
       //同样max-age的基准也要同Age，不然就有点坑了

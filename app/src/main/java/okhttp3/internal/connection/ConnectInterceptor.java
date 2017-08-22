@@ -35,14 +35,12 @@ public final class ConnectInterceptor implements Interceptor {
   @Override public Response intercept(Chain chain) throws IOException {
     RealInterceptorChain realChain = (RealInterceptorChain) chain;
     Request request = realChain.request();
-    //在正常的流程中，此处的StreamAllocation是在RetryAndFollowUpInterceptor中创建
-    //每一个Call都有一个url，一个url就会对应一个新的StreamAllocation
+    //每一个Call都有一个url，一个url就会对应一个新的StreamAllocation，即流分配者
     StreamAllocation streamAllocation = realChain.streamAllocation();
-
     // We need the network to satisfy this request. Possibly for validating a conditional GET.
     //检查当前请求是否GET请求
     boolean doExtensiveHealthChecks = !request.method().equals("GET");
-    //创建流和Connection，核心方法
+    //通过流分配者来处理流和Connection的创建，核心方法
     HttpCodec httpCodec = streamAllocation.newStream(client, doExtensiveHealthChecks);
     //注意在newStream中Connection已经创建，此处只是获取而已
     RealConnection connection = streamAllocation.connection();

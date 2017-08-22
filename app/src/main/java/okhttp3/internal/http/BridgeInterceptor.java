@@ -53,6 +53,7 @@ public final class BridgeInterceptor implements Interceptor {
     //body：请求内容（比方说数据、文件二进制等）
     //tag：当前request请求标记
     //headers：当前request已经配置的头部报文参数
+    //newBuilder会保留之前request中的数据
     Request.Builder requestBuilder = userRequest.newBuilder();
     RequestBody body = userRequest.body();
     //如果有正文体，设置一些正文相关的头部报文信息
@@ -64,34 +65,37 @@ public final class BridgeInterceptor implements Interceptor {
       }
 
       long contentLength = body.contentLength();
-      if (contentLength != -1) {
+      if (contentLength != -1) {//一般来说，推荐这种传输大小固定的模式
         requestBuilder.header("Content-Length", Long.toString(contentLength));
-        requestBuilder.removeHeader("Transfer-Encoding");
+        requestBuilder.removeHeader("Transfer-Encoding");//移除分块传输的头部
       } else {//当无法获取传输内容的大小的时候，标记当前传输内容不定
         requestBuilder.header("Transfer-Encoding", "chunked");
         requestBuilder.removeHeader("Content-Length");
       }
     }
-    //如果没有手动设置头部报文中的Host，则会采用设置的url中的域名
+    //如果没有手动设置头部报文中的Host，则会采用设置的url中的域名，添加不是覆盖
     //否则使用你手动设置的值，这个一般可以用于HttpDNS服务
     //在不修改域名的情况下改变Host进行IP直连访问，用于避开一些DNS服务异常的情况
     if (userRequest.header("Host") == null) {
+      //这里默认填充链接的host:port格式
       requestBuilder.header("Host", hostHeader(userRequest.url(), false));
     }
     //这个是用于标志长短连接的，一般close标志短连接，用于请求一些文档之类的，标志TCP可以很快进行4次握手结束连接
     //Keep-Alive表示长连接，在TCP进行完3次握手之后，这个过程中可以传输数据之类的，并不会很快进行4次握手结束连接
-    //一个重要的区别就是是否用同一个TCP握手过程
+    //长连接可以用于连接复用
     if (userRequest.header("Connection") == null) {
-      //一般APP用的都是长连接哈
+      //默认用长连接，提倡连接复用
       requestBuilder.header("Connection", "Keep-Alive");
     }
 
     // If we add an "Accept-Encoding: gzip" header field we're responsible for also decompressing
     // the transfer stream.
-    // 此处设置可以接受gzip格式的返回数据
     boolean transparentGzip = false;
+    // 当前没有主动告知服务端客户端所能够接收的编码类型，并且没有指定获取的数据范围
+    // 比方说分段下载的时候可以通过Range: bytes=1-10来说明要获取第1到第10个字节的数据
     if (userRequest.header("Accept-Encoding") == null && userRequest.header("Range") == null) {
       transparentGzip = true;
+      //用于告知服务器客户端所能够接收的编码类型，默认为GZIP
       requestBuilder.header("Accept-Encoding", "gzip");
     }
     //尝试从存储中获取cookies
@@ -103,7 +107,7 @@ public final class BridgeInterceptor implements Interceptor {
     if (userRequest.header("User-Agent") == null) {
       requestBuilder.header("User-Agent", Version.userAgent());
     }
-    //再次回调RealInterceptorChain的proceed方法
+    //再次回调RealInterceptorChain的proceed方法，通过其它拦截器发起请求
     Response networkResponse = chain.proceed(requestBuilder.build());
     //此处一般来说获取response成功
     //当请求完成之后，要尝试将cookie存入cookieJar当中
@@ -115,6 +119,7 @@ public final class BridgeInterceptor implements Interceptor {
     if (transparentGzip
         && "gzip".equalsIgnoreCase(networkResponse.header("Content-Encoding"))
         && HttpHeaders.hasBody(networkResponse)) {//这里是处理Gzip返回格式的数据
+      //通过GZIP的Source来处理数据的读取
       GzipSource responseBody = new GzipSource(networkResponse.body().source());
       Headers strippedHeaders = networkResponse.headers().newBuilder()
           .removeAll("Content-Encoding")

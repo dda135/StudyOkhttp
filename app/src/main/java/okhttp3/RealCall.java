@@ -80,9 +80,11 @@ final class RealCall implements Call {
   @Override public void enqueue(Callback responseCallback) {
     synchronized (this) {
       if (executed) throw new IllegalStateException("Already Executed");
-      executed = true;
+      executed = true;//标记当前请求开始执行
     }
     captureCallStackTrace();
+    // 这里将回调封装到AsyncCall中
+    // 然后将当前请求送入OkHttpClient中的Dispatcher中
     client.dispatcher().enqueue(new AsyncCall(responseCallback));
   }
 
@@ -175,17 +177,24 @@ final class RealCall implements Call {
      */
   Response getResponseWithInterceptorChain() throws IOException {
     // Build a full stack of interceptors.
-    //尝试建立一个拦截器列表，之后会进行一次链表调用
+    //尝试建立一个拦截器列表，之后会进行一次链式调用
+    //简单说就是从上到下执行获取response之前的过程，
+    //然后获取到response之后，再从下到上执行
     List<Interceptor> interceptors = new ArrayList<>();
-    //自定义的拦截器
+    //首先执行自定义的拦截器
     interceptors.addAll(client.interceptors());
+    //处理重试逻辑
     interceptors.add(retryAndFollowUpInterceptor);
+    //添加一些预定义头部之类的数据
     interceptors.add(new BridgeInterceptor(client.cookieJar()));
+    //处理http协议的缓存逻辑
     interceptors.add(new CacheInterceptor(client.internalCache()));
+    //处理socket建立连接或者复用连接过程，总之这里会建立连接
     interceptors.add(new ConnectInterceptor(client));
     if (!forWebSocket) {
       interceptors.addAll(client.networkInterceptors());
     }
+    //在已经建立的链接上进行参数发送和获取响应封装等操作
     interceptors.add(new CallServerInterceptor(forWebSocket));
 
     Interceptor.Chain chain = new RealInterceptorChain(

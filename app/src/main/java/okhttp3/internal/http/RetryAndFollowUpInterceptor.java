@@ -102,28 +102,34 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
   }
 
   @Override public Response intercept(Chain chain) throws IOException {
-    //首先获得当次请求的原始request
     Request request = chain.request();
-    //初始化网络流的数据，注意此处只是关联一些参数而已
+    //流的分配者，这里重点是通过当前请求连接构建Address和RouteSelector
     streamAllocation = new StreamAllocation(
         client.connectionPool(), createAddress(request.url()), callStackTrace);
 
-    int followUpCount = 0;//重定向的次数
-    Response priorResponse = null;//用于记录重定向上一次的响应
-    while (true) {//一个循环，那么简单说就是只有在获得合理响应的情况下才可能结束，重定向的话会进行响应的循环
+    int followUpCount = 0;//重定向的次数，最大20
+    Response priorResponse = null;//用于记录重定向之前上一次的响应成果，这个响应是会清空响应体的
+    while (true) {//用于重连或者重定向
       if (canceled) {//每一次请求之前先判断当前Call(Request)是否被要求取消
         streamAllocation.release();//清理连接池的资源，并且关闭Socket
         throw new IOException("Canceled");//直接在此处抛出IOException即可，会在AsyncCall中回调onFailure
       }
 
       Response response = null;
+      //用于标记每一次请求是否应该释放套接字连接
       boolean releaseConnection = true;
       try {
+        //进行请求
         response = ((RealInterceptorChain) chain).proceed(request, streamAllocation, null, null);
-        //正常来说此时服务端已经返回结果
+        //正常来说此时服务端已经返回结果，单次请求完成
         releaseConnection = false;
       } catch (RouteException e) {
         // The attempt to connect via a route failed. The request will not have been sent.
+        // 尝试连接到指定的节点时候失败
+        // 1.在通过host去dns查找ip地址的时候出现异常
+        // 2.进行socket连接过程中出现异常，实际上socket在连接的时候会尝试一直进行连接
+        // 除非retryOnConnectionFailure要求不能重连，或者socket连接过程中出现不可重新连接相关的异常的时候会抛出
+        // 后续会进行异常回调
         if (!recover(e.getLastConnectException(), false, request)) {
           throw e.getLastConnectException();
         }
@@ -131,20 +137,21 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
         continue;
       } catch (IOException e) {
         // An attempt to communicate with a server failed. The request may have been sent.
+        // 这个异常可能更多的出现在网络传输数据的时候
         boolean requestSendStarted = !(e instanceof ConnectionShutdownException);
         if (!recover(e, requestSendStarted, request)) throw e;
         releaseConnection = false;
         continue;
       } finally {
         // We're throwing an unchecked exception. Release any resources.
-        if (releaseConnection) {//此处正常来说都不需要释放连接
-          streamAllocation.streamFailed(null);
-          streamAllocation.release();
+        if (releaseConnection) {// 当前连接中出现异常，并且不可尝试重新连接
+          streamAllocation.streamFailed(null);//从复用池中移除当前连接，并且关闭当前套接字连接
+          streamAllocation.release();//标记当前流分配者后续不再可用
         }
       }
 
       // Attach the prior response if it exists. Such responses never have a body.
-      //初始化的时候一定为空，在重定向或者超时的情况下可能有值
+      // 在重试之前记录上一次请求的结果
       if (priorResponse != null) {
         //这里记录了上一次请求返回的响应，不过上一次请求的正文体在这里被置空
         //因为之前的响应的不应该被关心的，应该关心的是当前响应的正文体
@@ -155,53 +162,68 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
             .build();
       }
       //判断是否存在代理、重定向和一些异常情况，可能需要尝试发出新的请求
-      //对于APP来说可能关心408重连即可
+      //这里可能要进行新的请求的构建
       Request followUp = followUpRequest(response);
 
-      if (followUp == null) {//不需要重连，绝大部分情况下就是这样
-        if (!forWebSocket) {
-          streamAllocation.release();//关闭socket释放资源
+      if (followUp == null) {//不需要重定向
+        if (!forWebSocket) {//App连接非WebSocket
+          //标记当前流分配者后续不再可用，释放当前RealConnection所关联的流分配者
+          //通过连接池的空闲时间来判断当前连接是否回收，如果回收则会关闭socket
+          //否则会待在复用池中，等待复用或者在指定的时间后被清理
+          streamAllocation.release();
         }
-        return response;//如果一次回话正常结束，此处应该收尾
+        return response;//返回成功的响应结果
       }
-      //如果到这里，说明要重定向或者重新请求
+      //如果到这里，说明要重定向
       //先关闭之前服务端响应的输入流
       closeQuietly(response.body());
 
       if (++followUpCount > MAX_FOLLOW_UPS) {//最大重定向次数20
-        streamAllocation.release();
+        streamAllocation.release();//这里只是单纯的标记流分配者，连接本身会根据连接池状态觉得是否回收，同理socket也根据情况关闭
         throw new ProtocolException("Too many follow-up requests: " + followUpCount);
       }
 
       if (followUp.body() instanceof UnrepeatableRequestBody) {
-        streamAllocation.release();
+        streamAllocation.release();//这里只是单纯的标记流分配者，连接本身会根据连接池状态觉得是否回收，同理socket也根据情况关闭
         throw new HttpRetryException("Cannot retry streamed HTTP body", response.code());
       }
-      //判断当前是否可以重用连接，如果不能则需要新建流
+      //判断当前是否可以重用连接，主要是Route的问题，包括ip地址等数据
+      //如果不能则需要通过新的请求地址来新建连接
       if (!sameConnection(response, followUp.url())) {
-        streamAllocation.release();
+        streamAllocation.release();//这里只是单纯的标记流分配者，连接本身会根据连接池状态觉得是否回收，同理socket也根据情况关闭
+        //通过新的Address构建新的流分配者
         streamAllocation = new StreamAllocation(
             client.connectionPool(), createAddress(followUp.url()), callStackTrace);
       } else if (streamAllocation.codec() != null) {
         throw new IllegalStateException("Closing the body of " + response
             + " didn't close its backing stream. Bad interceptor?");
       }
-      //此处可能有重定向或一些特殊的错误，将会继续发起请求
+      //准备进行下一次重定向的请求
       request = followUp;
       priorResponse = response;
     }
   }
 
+  /**
+   * 在发起请求之前，通过当前链接和OkHttpClient中的一些配置
+   * 初始化当前请求的目标对象
+   * @param url 当前请求地址
+   * @return 封装后的请求目标对象
+   */
   private Address createAddress(HttpUrl url) {
     SSLSocketFactory sslSocketFactory = null;
     HostnameVerifier hostnameVerifier = null;
     CertificatePinner certificatePinner = null;
-    if (url.isHttps()) {
+    if (url.isHttps()) {//当前请求为Https请求
+      //初始化Https握手校验的工厂
       sslSocketFactory = client.sslSocketFactory();
+      //用于请求主机域名校验
       hostnameVerifier = client.hostnameVerifier();
+      //用于标记一些域名可信任的证书
       certificatePinner = client.certificatePinner();
     }
-
+    //主要包含了请求域名、端口、自定义的DNS、套接字工厂、SSL套接字工厂、域名校验
+    //Https证书锁定、代理认证、代理、支持协议、Https加密支持套件工厂、代理选择器
     return new Address(url.host(), url.port(), client.dns(), client.socketFactory(),
         sslSocketFactory, hostnameVerifier, certificatePinner, client.proxyAuthenticator(),
         client.proxy(), client.protocols(), client.connectionSpecs(), client.proxySelector());
@@ -212,20 +234,24 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
    * {@code e} is recoverable, or false if the failure is permanent. Requests with a body can only
    * be recovered if the body is buffered or if the failure occurred before the request has been
    * sent.
+   * 重连基本条件
    */
   private boolean recover(IOException e, boolean requestSendStarted, Request userRequest) {
-    streamAllocation.streamFailed(e);
+    streamAllocation.streamFailed(e);//这里会关闭之前的socket
 
-    // The application layer has forbidden retries.
+    // 应用层是否允许在连接失败之后重新尝试连接
     if (!client.retryOnConnectionFailure()) return false;
 
     // We can't send the request body again.
+    // 这个是Http2协议中的情况，这里先不考虑
     if (requestSendStarted && userRequest.body() instanceof UnrepeatableRequestBody) return false;
 
     // This exception is fatal.
+    // 检查当前异常类型，因为有的异常是无法再次进行重试连接的
     if (!isRecoverable(e, requestSendStarted)) return false;
 
-    // No more routes to attempt.
+    // 当前没有连接节点可以去尝试
+    // 一般来说就是当前节点
     if (!streamAllocation.hasMoreRoutes()) return false;
 
     // For failure recovery, use the same route selector with a new connection.
@@ -234,19 +260,26 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
 
   private boolean isRecoverable(IOException e, boolean requestSendStarted) {
     // If there was a protocol problem, don't recover.
+    // 协议异常，比方说协议规定的报文格式不符之类的情况
+    // 总之就是一些不满足当前协议的条件
     if (e instanceof ProtocolException) {
       return false;
     }
 
     // If there was an interruption don't recover, but if there was a timeout connecting to a route
     // we should try the next route (if there is one).
+    // 这个一般是Okio的异常，会在流操作超时之后抛出
+    // SocketTimeoutException一般可以认为是socket连接超时或者读写超时
+    // 这种时候可以尝试重连
     if (e instanceof InterruptedIOException) {
       return e instanceof SocketTimeoutException && !requestSendStarted;
     }
 
     // Look for known client-side or negotiation errors that are unlikely to be fixed by trying
     // again with a different route.
+    // 当前是Https握手失败异常
     if (e instanceof SSLHandshakeException) {
+      // 如果是证书异常，这样没有必要重试，因为重试了也会失败
       // If the problem was a CertificateException from the X509TrustManager,
       // do not retry.
       if (e.getCause() instanceof CertificateException) {

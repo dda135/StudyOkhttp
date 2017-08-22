@@ -93,7 +93,7 @@ public final class RealConnection extends Http2Connection.Listener implements Co
    * true的话要注意将不会在当前连接中创建新的流
    * */
   public boolean noNewStreams;
-  //标记当前连接的完成次数，StramFinished之类的时候有叠加
+  //标记当前连接的完成次数，StreamFinished之类的时候有叠加
   public int successCount;
 
   /**
@@ -128,7 +128,10 @@ public final class RealConnection extends Http2Connection.Listener implements Co
     if (protocol != null) throw new IllegalStateException("already connected");
 
     RouteException routeException = null;
+    //如果是Https协议，那么这里会涉及到一些加解密的套件，Http则为空
+    //这里就是获取所支持的套件，可以通过在OkHttpClient中自定义
     List<ConnectionSpec> connectionSpecs = route.address().connectionSpecs();
+    //辅助进行加解密套件选择的选择器
     ConnectionSpecSelector connectionSpecSelector = new ConnectionSpecSelector(connectionSpecs);
 
     if (route.address().sslSocketFactory() == null) {
@@ -142,8 +145,9 @@ public final class RealConnection extends Http2Connection.Listener implements Co
             "CLEARTEXT communication to " + host + " not permitted by network security policy"));
       }
     }
-
-    while (true) {//这里毫无疑问是一个阻塞性操作
+    //尝试去建立socket连接，有的时候单次失败，可以继续尝试
+    //除非在应用层指定了不可重连或者一些严重错误，重连没有意义
+    while (true) {
       try {
         if (route.requiresTunnel()) {
           connectTunnel(connectTimeout, readTimeout, writeTimeout);
@@ -155,6 +159,7 @@ public final class RealConnection extends Http2Connection.Listener implements Co
         establishProtocol(connectionSpecSelector);
         break;
       } catch (IOException e) {
+        //出现异常的时候先清理当前异常的连接数据
         closeQuietly(socket);
         closeQuietly(rawSocket);
         socket = null;
@@ -170,7 +175,9 @@ public final class RealConnection extends Http2Connection.Listener implements Co
         } else {
           routeException.addConnectException(e);
         }
-        //如果在OkHttpClient中设置不允许重连，那么在一次连接失败之后就会结束
+        // 如果在OkHttpClient中设置不允许重连，
+        // 或者存在一些严重的错误，重连没有意义
+        // 那么在一次连接失败之后就会结束
         if (!connectionRetryEnabled || !connectionSpecSelector.connectionFailed(e)) {
           throw routeException;
         }
@@ -250,10 +257,10 @@ public final class RealConnection extends Http2Connection.Listener implements Co
     //如果不是HTTPS协议，不需要进行TLS握手过程
     if (route.address().sslSocketFactory() == null) {
       protocol = Protocol.HTTP_1_1;
-      socket = rawSocket;
+      socket = rawSocket;//使用当前socket即可
       return;
     }
-    //如果为HTTPS，进行SSL握手
+    //如果为HTTPS，进行TLS握手
     connectTls(connectionSpecSelector);
 
     if (protocol == Protocol.HTTP_2) {
@@ -268,31 +275,33 @@ public final class RealConnection extends Http2Connection.Listener implements Co
 
   private void connectTls(ConnectionSpecSelector connectionSpecSelector) throws IOException {
     Address address = route.address();
+    //获得SSLSocket的工厂，这个默认为DefaultSocketFactory
+    //内部没有任何策略，只有创建socket而已
     SSLSocketFactory sslSocketFactory = address.sslSocketFactory();
     boolean success = false;
     SSLSocket sslSocket = null;
     try {
       // Create the wrapper over the connected socket.
-      // 注意此时的Socket已经完成握手过程，这里通过SSLSocketFactory来构建对应的SSLSocket
-      // 如果没有手动设置，默认可以看OkHttpClient中的systemDefaultSslSocketFactory
+      // 注意此时的Socket已经完成握手过程，这里通过SSLSocketFactory的策略来构建对应的SSLSocket
+      // 如果没有手动设置，默认可以看OkHttpClient中的DefaultSslSocketFactory
       sslSocket = (SSLSocket) sslSocketFactory.createSocket(
           rawSocket, address.url().host(), address.url().port(), true /* autoClose */);
 
       // Configure the socket's ciphers, TLS versions, and extensions.
       // ConnectionSpec的默认值可以看OkHttpClient中DEFAULT_CONNECTION_SPECS
-      // 此处主要是查找满足SSLSocket的TLS版本和Cipher，并且关联SSLSocket
+      // 此处主要是查找满足SSLSocket的TLS版本和加解密套件，并且关联SSLSocket
       ConnectionSpec connectionSpec = connectionSpecSelector.configureSecureSocket(sslSocket);
       // 此处必然为true
       if (connectionSpec.supportsTlsExtensions()) {
         //注意这里的实现类是AndroidPlatform
         //这里面主要是通过反射，然后用SSLSocket调用一些方法，来实现一些设置
-        //比方Session、Host和ALPN
+        //比方Session、Host和ALPN，细节不太清楚
         Platform.get().configureTlsExtensions(
             sslSocket, address.url().host(), address.protocols());
       }
 
       // Force handshake. This can throw!
-      //开始TLS握手流程
+      //开始TLS/SSL握手流程，
       sslSocket.startHandshake();
       //注意getSession会阻塞直到握手完成，此时获取握手的信息
       //这个Session包括服务端返回的TLS版本、Cipher组件、证书等信息
@@ -415,9 +424,10 @@ public final class RealConnection extends Http2Connection.Listener implements Co
    */
   public boolean isEligible(Address address, Route route) {
     // If this connection is not accepting new streams, we're done.
-    // 首先确认连接中是否可以容纳更多的流（或者就不允许新建流）
-    // 这里稍微注意一下，在HTTP2以前，一个Connection只能被一个StreamAllocation持有
-    // HTTP2的话可以做到多个StreamAllocation
+    // allocations.size()实际上表示当前连接被多少流使用中
+    // 在Http1.1中一个连接同时只能有一个流使用，所以只有等到一个流完成使用完毕之后
+    // 后面的流才能复用当前连接
+    // noNewStreams顾名思义不允许复用流
     if (allocations.size() >= allocationLimit || noNewStreams) return false;
 
     // If the non-host fields of the address don't overlap, we're done.
@@ -425,7 +435,7 @@ public final class RealConnection extends Http2Connection.Listener implements Co
     if (!Internal.instance.equalsNonHost(this.route.address(), address)) return false;
 
     // If the host exactly matches, we're done: this connection can carry the address.
-    //如果请求host一致，则认为当前连接可以携带此流，对于绝大部分APP来说都会满足这个条件
+    //如果请求host一致，则认为当前连接可以携带此流
     if (address.url().host().equals(this.route().address().url().host())) {
       return true; // This connection is a perfect match.
     }
@@ -436,7 +446,7 @@ public final class RealConnection extends Http2Connection.Listener implements Co
     // https://daniel.haxx.se/blog/2016/08/18/http2-connection-coalescing/
 
     // 1. This connection must be HTTP/2.
-    //在host无法匹配的情况下，http2.0下有可能可以重用连接
+    //在host无法匹配的情况下，http2.0下有可能可以重用连接,http1.x到这里就不符合重用的条件了
     if (http2Connection == null) return false;
 
     // 2. The routes must share an IP address. This requires us to have a DNS address for both
@@ -471,6 +481,7 @@ public final class RealConnection extends Http2Connection.Listener implements Co
 
     return true; // The caller's address can be carried by this connection.
   }
+
 
   public boolean supportsUrl(HttpUrl url) {
     if (url.port() != route.address().url().port()) {
@@ -533,12 +544,12 @@ public final class RealConnection extends Http2Connection.Listener implements Co
     if (http2Connection != null) {
       return !http2Connection.isShutdown();
     }
-    //当这里都不是Http2.0
-    if (doExtensiveChecks) {//POST这里为true
+    //POST这里为true，GET不需要校验这个，因为不需要传参
+    if (doExtensiveChecks) {
       try {
         //具体检查方式可以看注释
-        //大概就是改变socket的读取时间为最小
-        //然后尝试去
+        //通过设置SO_TIMEOUT来修改socket读取数据的最大超时时间
+        //如果抛出socket超时异常，说明socket连接正常
         int readTimeout = socket.getSoTimeout();
         try {
           socket.setSoTimeout(1);
@@ -555,7 +566,7 @@ public final class RealConnection extends Http2Connection.Listener implements Co
         return false; // Couldn't read; socket is closed.
       }
     }
-
+    //这里一般就是socket的读取超时异常，说明当前连接正常
     return true;
   }
 

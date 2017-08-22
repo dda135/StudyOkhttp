@@ -97,10 +97,12 @@ public final class Http1Codec implements HttpCodec {
       // 此处可以回想一下BridgeInterceptor中的情况，Transfer-Encoding: chunked
       // 相当于在RequestBody中的Content-Length为-1，简单理解就是无法预测长度
       // Stream a request body of unknown length.
+      // 会根据需要一直读
       return newChunkedSink();
     }
 
     if (contentLength != -1) {
+      // 只能读取指定的字节数
       // Stream a request body of a known length.
       return newFixedLengthSink(contentLength);
     }
@@ -141,11 +143,11 @@ public final class Http1Codec implements HttpCodec {
     if (!HttpHeaders.hasBody(response)) {
       return newFixedLengthSource(0);
     }
-
+    //分块传输模式，一般就是不确定当前数据大小的时候使用
     if ("chunked".equalsIgnoreCase(response.header("Transfer-Encoding"))) {
       return newChunkedSource(response.request().url());
     }
-
+    //固定大小，会指定在头部报文的Content-Length中
     long contentLength = HttpHeaders.contentLength(response);
     if (contentLength != -1) {
       return newFixedLengthSource(contentLength);
@@ -404,7 +406,10 @@ public final class Http1Codec implements HttpCodec {
       }
 
       bytesRemaining -= read;
-      if (bytesRemaining == 0) {
+      if (bytesRemaining == 0) {//当前数据读完了
+        //实际上关注这里就好了，一旦数据读取完成，这里就会去处理连接完成
+        //true的话表示连接可以复用
+        //会释放连接的引用，标记连接池中当前连接可以复用了
         endOfInput(true);
       }
       return read;

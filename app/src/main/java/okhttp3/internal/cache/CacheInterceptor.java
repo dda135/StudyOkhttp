@@ -50,8 +50,9 @@ public final class CacheInterceptor implements Interceptor {
   }
 
   @Override public Response intercept(Chain chain) throws IOException {
-    //尝试先从cache中通过对应的request获取response
-    //注意这个cache是在Client中自定义的缓存，默认为空
+    //需要在OkHttpClient.Builder中指定所使用的硬盘缓存，否则默认为null
+    //默认的话可以使用OkHttp提供的Cache类，里面默认使用DiskLruCache进行最近最少使用管理
+    //缓存的文件名默认是请求连接的md5编码
     Response cacheCandidate = cache != null
         ? cache.get(chain.request())
         : null;
@@ -62,20 +63,21 @@ public final class CacheInterceptor implements Interceptor {
     //在不需要发出请求的时候，request为null，比方说成功获取缓存或者request中设置了only-if-cached
     //在没有自定义缓存的情况下，cacheResponse为null，当然此时request可能null
     //注意此处如果cacheResponse不为空，它至少也是cacheCandidate的一个深拷贝
-    Request networkRequest = strategy.networkRequest;
-    Response cacheResponse = strategy.cacheResponse;
+    Request networkRequest = strategy.networkRequest;//为空意味着不需要发出请求
+    Response cacheResponse = strategy.cacheResponse;//为空意味着没有集中缓存数据
 
     if (cache != null) {
       //此处统计用的，可以记录请求次数和击中缓存次数和网络请求次数
       cache.trackResponse(strategy);
     }
-    //获取缓存失败或者缓存已经过期，可以释放掉旧的缓存的资源
+    //当前缓存不可用，释放cacheCandidate中的数据
     if (cacheCandidate != null && cacheResponse == null) {
       closeQuietly(cacheCandidate.body()); // The cache candidate wasn't applicable. Close it.
     }
 
     // If we're forbidden from using the network and the cache is insufficient, fail.
     // 此处可以认为在only-if-cached的情况下获取缓存失败
+    // 当前有且只从缓存中获取数据，但是缓存中没有数据
     if (networkRequest == null && cacheResponse == null) {
       //这里返回504请求超时，说明服务端没有在合适时间内收到客户端的请求
       return new Response.Builder()
@@ -92,26 +94,25 @@ public final class CacheInterceptor implements Interceptor {
     // If we don't need the network, we're done.
     // 如果此时不需要发出网络请求，比方说击中缓存
     if (networkRequest == null) {
-      //返回缓存即可
+      //返回缓存即可，这里的cacheResponse记录一个没有实际body数据的自己
       return cacheResponse.newBuilder()
           .cacheResponse(stripBody(cacheResponse))
           .build();
     }
-    //来到这里说明没有击中缓存，并且要继续请求的发起
+    //来到这里说明没有击中缓存，并且要继续发起请求
     Response networkResponse = null;
     try {
-      //回调下一个拦截器
+      //回调下一个拦截器进而发起请求
       networkResponse = chain.proceed(networkRequest);
       //此处返回的是服务端的响应
     } finally {
-      // If we're crashing on I/O or otherwise, don't leak the cache body.
       if (networkResponse == null && cacheCandidate != null) {
         closeQuietly(cacheCandidate.body());
       }
     }
 
     // If we have a cache response too, then we're doing a conditional get.
-    //如果当前有本地缓存
+    // 如果当前有本地缓存
     if (cacheResponse != null) {
       //注意此时的逻辑，完整来说
       //首先客户端通过request和缓存response中header的标志认为缓存对于客户端来说已经过期了
@@ -119,10 +120,15 @@ public final class CacheInterceptor implements Interceptor {
       //服务端会通过这个信息来判断当前服务端的数据是不是最新的，如果不是则返回304
       if (networkResponse.code() == HTTP_NOT_MODIFIED) {
         //这时候说明客户端的缓存其实还是服务端最新的数据，那么重新组装一下header等信息即可
+        //此时服务端是不应该返回数据的
         Response response = cacheResponse.newBuilder()
+                //组合拼装响应报文，主要是哪部分属于缓存响应报文，哪部分属于当前响应报文的问题
             .headers(combine(cacheResponse.headers(), networkResponse.headers()))
+                //修改当前请求的发出时间为此次命中缓存的请求的发出时间
             .sentRequestAtMillis(networkResponse.sentRequestAtMillis())
+                //修改当前响应接收到响应的时间
             .receivedResponseAtMillis(networkResponse.receivedResponseAtMillis())
+                //标记缓存响应和网络响应体，但是都需要清空body部分
             .cacheResponse(stripBody(cacheResponse))
             .networkResponse(stripBody(networkResponse))
             .build();
@@ -133,7 +139,9 @@ public final class CacheInterceptor implements Interceptor {
         // Content-Encoding header (as performed by initContentStream()).
         //击中缓存次数+1，虽然还是发出了请求
         cache.trackConditionalCacheHit();
-        //更新缓存，主要是刷新头部之类的信息，因为至少可以延迟当前response的有效期
+        //更新缓存，主要是刷新头部之类的信息
+        //因为当前响应可能更新了Cache-Control
+        //需要修改当前缓存体的策略
         cache.update(cacheResponse, response);
         return response;
       } else {
@@ -147,10 +155,10 @@ public final class CacheInterceptor implements Interceptor {
         .networkResponse(stripBody(networkResponse))
         .build();
 
-    if (HttpHeaders.hasBody(response)) {//这里是判断报文是否有内容体
-      //判断当前网络响应是否可以缓存，注意一下这里如果可以缓存的话会先将header之类的写入cacheRequest当中
+    if (HttpHeaders.hasBody(response)) {//这里是判断当前响应报文是否有内容体
+      //判断当前网络响应是否可以缓存，注意一下这里如果可以缓存的话会先将起始行和header之类的写入cache当中
       CacheRequest cacheRequest = maybeCache(response, networkResponse.request(), cache);
-      //这里是将response的body写入cacheRequest的body当中，至此整个
+      //这里是将response的body写入cacheRequest的body当中
       response = cacheWritingResponse(cacheRequest, response);
     }
 
@@ -168,8 +176,11 @@ public final class CacheInterceptor implements Interceptor {
     if (responseCache == null) return null;
 
     // Should we cache this response for this request?
-    if (!CacheStrategy.isCacheable(userResponse, networkRequest)) {
-      //这里说一种情况，在no-store的情况下，对于POST请求需要清理之前的缓存，当然也许之前并没有缓存
+    // 当前请求是否允许将数据写入硬盘缓存
+    // 要求userResponse和networkRequest中报文头部的Cache-Control中没有no_store标记
+    if (!CacheStrategy.Factory.isCacheable(userResponse, networkRequest)) {
+      //当前响应不允许缓存
+      //但是硬盘缓存中可能有当前请求连接旧的缓存，这里将之前的缓存移除
       if (HttpMethod.invalidatesCache(networkRequest.method())) {
         try {
           responseCache.remove(networkRequest);
@@ -181,7 +192,7 @@ public final class CacheInterceptor implements Interceptor {
     }
 
     // Offer this request to the cache.
-    // 当前允许进行缓存，则缓存之
+    // 当前允许进行缓存，则缓存之，注意这里只写入了起始行和一些头部报文
     return responseCache.put(userResponse);
   }
 
@@ -261,16 +272,22 @@ public final class CacheInterceptor implements Interceptor {
         continue; // Drop 100-level freshness warnings.
       }
       if (!isEndToEnd(fieldName) || networkHeaders.get(fieldName) == null) {
+        //"Connection"、"Keep-Alive"、"Proxy-Authenticate"、"Proxy-Authorization"
+        //"TE"、"Trailers"、"Transfer-Encoding"、"Upgrade"这些字段用上次缓存响应的报文数据即可
+        //以及当前响应报文中有的而缓存的响应报文中没有的字段
         Internal.instance.addLenient(result, fieldName, value);
       }
     }
 
     for (int i = 0, size = networkHeaders.size(); i < size; i++) {
       String fieldName = networkHeaders.name(i);
-      if ("Content-Length".equalsIgnoreCase(fieldName)) {
+      if ("Content-Length".equalsIgnoreCase(fieldName)) {//当前请求不会包含数据，那么不应该使用Content-Length这个字段
         continue; // Ignore content-length headers of validating responses.
       }
       if (isEndToEnd(fieldName)) {
+        //添加"Connection"、"Keep-Alive"、"Proxy-Authenticate"、"Proxy-Authorization"
+        //"TE"、"Trailers"、"Transfer-Encoding"、"Upgrade"以外的字段
+        //比方说Cache-Control
         Internal.instance.addLenient(result, fieldName, networkHeaders.value(i));
       }
     }

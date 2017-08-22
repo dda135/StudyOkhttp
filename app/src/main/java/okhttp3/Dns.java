@@ -36,7 +36,7 @@ public interface Dns {
   Dns SYSTEM = new Dns() {
     @Override public List<InetAddress> lookup(String hostname) throws UnknownHostException {
       if (hostname == null) throw new UnknownHostException("hostname == null");
-      return Arrays.asList(InetAddress.getAllByName(hostname));
+      return Arrays.asList(InetAddress.getAllByName(hostname));//这里会返回IP、端口等数据的liebiao
     }
   };
 

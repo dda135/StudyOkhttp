@@ -171,6 +171,7 @@ public final class Address {
   }
 
   boolean equalsNonHost(Address that) {
+    //仅仅没有校验域名
     return this.dns.equals(that.dns)
         && this.proxyAuthenticator.equals(that.proxyAuthenticator)
         && this.protocols.equals(that.protocols)

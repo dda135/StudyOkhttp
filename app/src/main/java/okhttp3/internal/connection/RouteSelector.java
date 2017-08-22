@@ -71,9 +71,17 @@ public final class RouteSelector {
 
   public Route next() throws IOException {
     // Compute the next route to attempt.
-    if (!hasNextInetSocketAddress()) {//第一次进入的时候此处因为还未添加Address，则必然为false
-      //在初始化的时候如果没有代理proxies中默认也会有NO_PROXY一个子项，则此处默认为true
+    // 判断当前是否有下一个可用的IP地址
+    // 第一次进入的时候此处因为还未查找IP地址，则必然为false
+    // 后续进入，比方说一开始查找IP地址的时候获得两个节点，然后第一个节点连接失败
+    // 进行重连，此时会去使用第二个节点
+    if (!hasNextInetSocketAddress()) {
+      //要尝试通过代理去将域名转换为IP，并且存储起来
+      //此处是查找下一个代理，默认只有NO_PROXY一个子项
       if (!hasNextProxy()) {
+        //在获取节点的时候如果有的节点已经被标记过失败了，那么会优先跳过
+        //但是跳过之后发现没有其它节点可用了，那么还是会使用这个节点
+        //否则抛出无可用节点异常，这个会直接在onFailed回调
         if (!hasNextPostponed()) {
           throw new NoSuchElementException();
         }
@@ -83,12 +91,16 @@ public final class RouteSelector {
       lastProxy = nextProxy();
       //在nextProxy中已经通过InetAddress通过Host获得对应IP和端口列表
     }
-    //这里仅仅是获取InetAddress返回的第一个地址，但是计数会增长
+    //当前有可用的节点
+    //这里一开始是获取InetAddress返回的第一个地址，但是计数会增长
+    //后续进入相当于选择其它节点，前提是存在其他节点
     lastInetSocketAddress = nextInetSocketAddress();
-
+    //构建一个路由
     Route route = new Route(address, lastProxy, lastInetSocketAddress);
+    //当前查找的节点之前已经被标记失败了，一般这种都是在重连/重定向的场景
+    //尽可能避免使用当前节点
     if (routeDatabase.shouldPostpone(route)) {
-      postponedRoutes.add(route);
+      postponedRoutes.add(route);//存储曾经被标记为失败的但是还是可以用的节点
       // We will only recurse in order to skip previously failed routes. They will be tried last.
       return next();
     }
@@ -144,6 +156,7 @@ public final class RouteSelector {
   /** Prepares the socket addresses to attempt for the current proxy or host. */
   private void resetNextInetSocketAddress(Proxy proxy) throws IOException {
     // Clear the addresses. Necessary if getAllByName() below throws!
+    // 新建一个IP地址的列表
     inetSocketAddresses = new ArrayList<>();
 
     String socketHost;
@@ -172,7 +185,9 @@ public final class RouteSelector {
       inetSocketAddresses.add(InetSocketAddress.createUnresolved(socketHost, socketPort));
     } else {
       // Try each address for best behavior in mixed IPv4/IPv6 environments.
-      // 默认为DNS.SYSTEM，内部InetAddress.getAllByName(hostname)会返回IP和端口列表
+      // 这里的dns()实际上是可以在OkHttpClient.Builder中自己设置的，默认是DNS.SYSTEM
+      // 内部会通过InetAddress.getAllByName(hostname)会返回IP和端口列表
+      // 相当于默认的发起一个请求到DNS服务器，获取当前域名对应的IP地址
       List<InetAddress> addresses = address.dns().lookup(socketHost);
       //记录当前域名可能返回的所有IP地址和端口
       for (int i = 0, size = addresses.size(); i < size; i++) {
@@ -180,7 +195,7 @@ public final class RouteSelector {
         inetSocketAddresses.add(new InetSocketAddress(inetAddress, socketPort));
       }
     }
-
+    //标记当前从第一个IP地址开始选择
     nextInetSocketAddressIndex = 0;
   }
 
